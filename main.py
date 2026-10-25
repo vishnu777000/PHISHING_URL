@@ -1,268 +1,145 @@
-import sys
 import argparse
 import json
-import pickle
-import pandas as pd
 from pathlib import Path
-import warnings
+import sys
 
-warnings.filterwarnings("ignore", category=UserWarning)
+import joblib
+import pandas as pd
+
 
 BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR / 'training'))
+MODEL_PATH = BASE_DIR / "model" / "phishing_model_final.joblib"
+METADATA_PATH = BASE_DIR / "model" / "model_metadata.json"
+OUTPUT_BORDER = "=" * 60
+sys.path.insert(0, str(BASE_DIR / "training"))
+from feature_extraction import extract_features
 
-try:
-    from feature_extraction import extract_features
-except ImportError:
-    print("Error: Could not import 'extract_features' from 'training.feature_extraction'.")
-    sys.exit(1)
 
-def load_model_data():
-    models_dir = BASE_DIR / "models"
-    model_dir = BASE_DIR / "model"
-    
-    if (models_dir / "phishing_model_final.pkl").exists():
-        model_path = models_dir / "phishing_model_final.pkl"
-    elif (model_dir / "phishing_model.pkl").exists():
-        model_path = model_dir / "phishing_model.pkl"
+def load_model():
+    if not MODEL_PATH.exists() or not METADATA_PATH.exists():
+        raise FileNotFoundError(
+            "Trained model artifacts are missing. Run: python training/train_final_model.py"
+        )
+
+    model = joblib.load(MODEL_PATH)
+    metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    feature_names = metadata.get("feature_names", [])
+    current_features = list(extract_features("example.com"))
+    if feature_names != current_features:
+        raise RuntimeError("Saved model feature order does not match the current URL extractor.")
+    return model, metadata
+
+
+def predict_url(url, model, metadata):
+    features = extract_features(url)
+    feature_names = metadata["feature_names"]
+    if list(features) != feature_names:
+        raise RuntimeError("Prediction feature names or order do not match the saved model.")
+
+    feature_row = pd.DataFrame([[features[name] for name in feature_names],], columns=feature_names)
+    cutoff = float(metadata["decision_cutoff"])
+    has_probabilities = hasattr(model, "predict_proba")
+    if has_probabilities:
+        class_index = list(model.classes_).index(1)
+        phishing_score = float(model.predict_proba(feature_row)[0][class_index])
     else:
-        print("Error: Model file not found.")
-        sys.exit(1)
-        
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+        positive_index = list(model.classes_).index(1)
+        margin = float(model.decision_function(feature_row)[0])
+        phishing_score = margin if positive_index == 1 else -margin
 
-    if (models_dir / "feature_names_final.pkl").exists():
-        fn_path = models_dir / "feature_names_final.pkl"
-    elif (model_dir / "feature_names.pkl").exists():
-        fn_path = model_dir / "feature_names.pkl"
-    else:
-        print("Error: Feature names file not found.")
-        sys.exit(1)
-        
-    with open(fn_path, 'rb') as f:
-        feature_names = pickle.load(f)
-
-    thresholds = {
-        'threshold': 0.50,
-        'high_risk_threshold': 0.80,
-        'suspicious_threshold': 0.30
-    }
-    
-    threshold_path = models_dir / "threshold.json"
-    if threshold_path.exists():
-        with open(threshold_path, 'r') as f:
-            data = json.load(f)
-            thresholds.update(data)
-            
-    return model, feature_names, thresholds
-
-def get_feature_importances(model, feature_names):
-    importances = None
-    if hasattr(model, 'feature_importances_'):
-        importances = model.feature_importances_
-    elif hasattr(model, 'coef_'):
-        importances = abs(model.coef_[0])
-    
-    if importances is not None:
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importances
-        }).sort_values('importance', ascending=False)
-        if importance_df['importance'].sum() > 0:
-            importance_df['importance'] = (importance_df['importance'] / importance_df['importance'].sum()) * 100
-        return importance_df
-    return None
-
-def predict_url(url, model, feature_names, thresholds, importances_df=None):
-    try:
-        features = extract_features(url)
-    except Exception as e:
-        return {"error": f"Error extracting features: {e}"}
-        
-    df = pd.DataFrame([features])
-    df = df.reindex(columns=feature_names, fill_value=0)
-    
-    try:
-        proba = model.predict_proba(df)[0]
-    except Exception as e:
-        return {"error": f"Error predicting: {e}"}
-        
-    benign_prob = proba[0]
-    phishing_prob = proba[1] if len(proba) > 1 else 0.0
-    
-    t = thresholds.get('threshold', 0.50)
-    ht = thresholds.get('high_risk_threshold', 0.80)
-    st = thresholds.get('suspicious_threshold', 0.30)
-    
-    if phishing_prob >= t and phishing_prob >= ht:
-        pred = "PHISHING"
-        risk = "HIGH"
-        confidence = phishing_prob
-    elif phishing_prob >= t and phishing_prob < ht:
-        pred = "PHISHING"
-        risk = "MEDIUM"
-        confidence = phishing_prob
-    elif phishing_prob < t and phishing_prob >= st:
-        pred = "SUSPICIOUS"
-        risk = "MEDIUM"
-        confidence = 1.0 - phishing_prob
-    else:
-        pred = "BENIGN"
-        risk = "LOW"
-        confidence = benign_prob
-        
-    top_features = []
-    if importances_df is not None:
-        for _, row in importances_df.head(5).iterrows():
-            feat = row['feature']
-            imp = row['importance']
-            val = features.get(feat, 0)
-            top_features.append((feat, val, imp))
-            
+    prediction = "PHISHING" if phishing_score >= cutoff else "BENIGN"
     return {
         "url": url,
-        "prediction": pred,
-        "risk": risk,
-        "confidence": confidence,
-        "benign_prob": benign_prob,
-        "phishing_prob": phishing_prob,
-        "top_features": top_features
+        "prediction": prediction,
+        "score": phishing_score,
+        "score_name": "phishing_probability" if has_probabilities else "phishing_margin",
+        "has_probabilities": has_probabilities,
+        "cutoff": cutoff,
     }
 
-def print_single_result(res):
-    if "error" in res:
-        print(f"Error processing URL: {res['error']}")
-        return
-        
-    print(f"\n{'═'*62}")
-    print(f"  PHISHING URL DETECTOR")
-    print(f"{'═'*62}\n")
-    print(f"  URL:                 {res['url']}")
-    print(f"  Prediction:          {res['prediction']}")
-    print(f"  Confidence:          {res['confidence']*100:.1f}%")
-    print(f"  Risk:                {res['risk']}\n")
-    print(f"  Benign Probability:  {res['benign_prob']*100:.1f}%")
-    print(f"  Phishing Probability: {res['phishing_prob']*100:.1f}%\n")
-    
-    if res['top_features']:
-        print("  Top Risk Indicators:")
-        for i, (feat, val, imp) in enumerate(res['top_features'], 1):
-            val_str = f"{val:.4f}" if isinstance(val, float) else str(val)
-            print(f"    {i}. {feat} = {val_str:<10} (importance: {imp:.1f}%)")
-            
-    print(f"\n{'═'*62}\n")
 
-def process_batch(file_path, output_path, model, feature_names, thresholds, importances_df):
-    try:
-        df = pd.read_csv(file_path)
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-        return
-        
-    url_col = None
-    if 'url' in df.columns:
-        url_col = 'url'
-    elif 'URL' in df.columns:
-        url_col = 'URL'
+def print_result(result):
+    print(OUTPUT_BORDER)
+    print("PHISHING URL DETECTOR")
+    print(OUTPUT_BORDER)
+    print()
+    print("URL:")
+    print(result["url"])
+    print()
+    print(f"Prediction: {result['prediction']}")
+    if result["has_probabilities"]:
+        print(f"Benign probability: {(1 - result['score']) * 100:.2f}%")
+        print(f"Phishing probability: {result['score'] * 100:.2f}%")
     else:
-        print("Error: CSV must contain a 'url' or 'URL' column.")
-        return
-        
-    urls = df[url_col].dropna().tolist()
-    if not urls:
-        print("No URLs found to process.")
-        return
-        
-    print(f"Processing {len(urls)} URLs...\n")
-    
-    results = []
-    counts = {"BENIGN": 0, "PHISHING": 0, "SUSPICIOUS": 0, "ERROR": 0}
-    
-    for url in urls:
-        if not str(url).strip():
-            continue
-        res = predict_url(url, model, feature_names, thresholds, importances_df)
-        if "error" in res:
-            print(f"[ERROR] {url} - {res['error']}")
-            counts["ERROR"] += 1
-            results.append({
-                "url": url,
-                "prediction": "ERROR",
-                "confidence": 0,
-                "risk": "UNKNOWN",
-                "benign_prob": 0,
-                "phishing_prob": 0
-            })
-            continue
-            
-        print(f"[{res['prediction']:^10}] ({res['confidence']*100:5.1f}%) {url}")
-        counts[res['prediction']] += 1
-        
-        results.append({
-            "url": url,
-            "prediction": res['prediction'],
-            "confidence": res['confidence'],
-            "risk": res['risk'],
-            "benign_prob": res['benign_prob'],
-            "phishing_prob": res['phishing_prob']
-        })
-        
-    print(f"\nSummary:")
-    print(f"Total:      {len(urls)}")
-    print(f"Benign:     {counts['BENIGN']}")
-    print(f"Phishing:   {counts['PHISHING']}")
-    print(f"Suspicious: {counts['SUSPICIOUS']}")
-    if counts["ERROR"] > 0:
-        print(f"Errors:     {counts['ERROR']}")
-        
-    if output_path:
-        out_df = pd.DataFrame(results)
-        try:
-            out_df.to_csv(output_path, index=False)
-            print(f"\nResults saved to {output_path}")
-        except Exception as e:
-            print(f"Error saving results: {e}")
+        print(f"Phishing decision margin: {result['score']:.4f}")
+    print(f"Decision threshold: {result['cutoff']:.2f}")
+    print(OUTPUT_BORDER)
 
-def interactive_mode(model, feature_names, thresholds, importances_df):
-    print(f"\n{'═'*62}")
-    print(f"  PHISHING URL DETECTOR - INTERACTIVE MODE")
-    print(f"  Type 'exit' or 'quit' to stop.")
-    print(f"{'═'*62}\n")
-    
+
+def scan_file(input_file, output_file, model, metadata):
+    frame = pd.read_csv(input_file)
+    url_column = next((column for column in ("URL", "url") if column in frame), None)
+    if url_column is None:
+        raise ValueError("CSV input must contain a URL or url column.")
+
+    results = []
+    for url in frame[url_column]:
+        try:
+            results.append(predict_url(url, model, metadata))
+        except (TypeError, ValueError, RuntimeError) as error:
+            results.append({"url": url, "prediction": "ERROR", "error": str(error)})
+
+    pd.DataFrame(results).to_csv(output_file, index=False)
+    print(f"Results saved to: {output_file}")
+
+
+def interactive_mode(model, metadata):
+    print("Type 'exit' to quit.")
     while True:
         try:
-            url = input("Enter URL to scan: ").strip()
-            if not url:
-                continue
-            if url.lower() in ['exit', 'quit']:
-                break
-            
-            res = predict_url(url, model, feature_names, thresholds, importances_df)
-            print_single_result(res)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Error: {e}")
+            url = input("\nEnter URL: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if url.lower() in {"exit", "quit"}:
+            return
+        if not url:
+            print("Enter a URL or type 'exit' to quit.")
+            continue
+        try:
+            print_result(predict_url(url, model, metadata))
+        except (TypeError, ValueError, RuntimeError) as error:
+            print(f"Invalid URL: {error}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Phishing URL Detector Predictor")
-    parser.add_argument("--url", type=str, help="Scan a single URL")
-    parser.add_argument("--file", type=str, help="Scan all URLs from a CSV file")
-    parser.add_argument("--output", type=str, help="Save batch results to CSV")
-    
+    parser = argparse.ArgumentParser(description="URL-based phishing classifier")
+    parser.add_argument("--url", help="Classify one URL")
+    parser.add_argument("--file", help="Classify URLs from a CSV file")
+    parser.add_argument("--output", default="prediction_results.csv", help="Batch results CSV path")
     args = parser.parse_args()
-    
-    model, feature_names, thresholds = load_model_data()
-    importances_df = get_feature_importances(model, feature_names)
-    
-    if args.url:
-        res = predict_url(args.url, model, feature_names, thresholds, importances_df)
-        print_single_result(res)
-    elif args.file:
-        process_batch(args.file, args.output, model, feature_names, thresholds, importances_df)
-    else:
-        interactive_mode(model, feature_names, thresholds, importances_df)
 
-if __name__ == '__main__':
+    try:
+        model, metadata = load_model()
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        print(f"Startup error: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.url:
+        try:
+            print_result(predict_url(args.url, model, metadata))
+        except (TypeError, ValueError, RuntimeError) as error:
+            print(f"Invalid URL: {error}", file=sys.stderr)
+            raise SystemExit(2)
+    elif args.file:
+        try:
+            scan_file(args.file, args.output, model, metadata)
+        except (OSError, ValueError) as error:
+            print(f"Input error: {error}", file=sys.stderr)
+            raise SystemExit(2)
+    else:
+        interactive_mode(model, metadata)
+
+
+if __name__ == "__main__":
     main()

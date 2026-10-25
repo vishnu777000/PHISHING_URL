@@ -1,0 +1,43 @@
+Held-out test evaluation; prediction cutoffs are the model defaults.
+
+Logistic Regression
+              precision    recall  f1-score   support
+
+      Benign       0.98      0.99      0.99     27020
+    Phishing       0.99      0.98      0.98     20010
+
+    accuracy                           0.98     47030
+   macro avg       0.99      0.98      0.98     47030
+weighted avg       0.98      0.98      0.98     47030
+
+Confusion matrix (rows=true [benign, phishing], columns=predicted):
+[[26787   233]
+ [  482 19528]]
+
+Random Forest
+              precision    recall  f1-score   support
+
+      Benign       0.98      0.99      0.99     27020
+    Phishing       0.99      0.98      0.98     20010
+
+    accuracy                           0.98     47030
+   macro avg       0.98      0.98      0.98     47030
+weighted avg       0.98      0.98      0.98     47030
+
+Confusion matrix (rows=true [benign, phishing], columns=predicted):
+[[26747   273]
+ [  452 19558]]
+
+Linear SVM
+              precision    recall  f1-score   support
+
+      Benign       0.98      0.99      0.99     27020
+    Phishing       0.99      0.97      0.98     20010
+
+    accuracy                           0.98     47030
+   macro avg       0.98      0.98      0.98     47030
+weighted avg       0.98      0.98      0.98     47030
+
+Confusion matrix (rows=true [benign, phishing], columns=predicted):
+[[26775   245]
+ [  517 19493]]
